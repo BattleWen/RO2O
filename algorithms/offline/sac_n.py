@@ -1,58 +1,56 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
-from copy import deepcopy
-from dataclasses import asdict, dataclass
+# Inspired by:
+# 1. paper for SAC-N: https://arxiv.org/abs/2110.01548
+# 2. implementation: https://github.com/snu-mllab/EDAC
 import math
 import os
 import random
 import uuid
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import d4rl
 import gym
 import numpy as np
 import pyrallis
 import torch
-from torch.distributions import Normal
 import torch.nn as nn
-from tqdm import trange
 import wandb
-import yaml
-import torch.nn.functional as F
+from torch.distributions import Normal
+from tqdm import trange
 
 @dataclass
 class TrainConfig:
     # wandb params
     project: str = "CORL"
-    group: str = "MSG"
-    name: str = "MSG"
+    group: str = "SAC-N"
+    name: str = "SAC-N"
     # model params
     hidden_dim: int = 256
     num_critics: int = 10
     gamma: float = 0.99
     tau: float = 5e-3
-    alpha: float = 0.5
-    beta: float = -4.0
     actor_learning_rate: float = 3e-4
     critic_learning_rate: float = 3e-4
-
+    alpha_learning_rate: float = 3e-4
     max_action: float = 1.0
     # training params
     buffer_size: int = 1_000_000
     env_name: str = "halfcheetah-medium-v2"
     batch_size: int = 256
-    num_warmed_epochs: int = 100
-    num_epochs: int = 2500
+    num_epochs: int = 3000
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     # evaluation params
     eval_episodes: int = 10
     eval_every: int = 5
     # general params
-    checkpoints_path: Optional[str] = './checkpoints/'
+    checkpoints_path: Optional[str] = None
     deterministic_torch: bool = False
     train_seed: int = 10
     eval_seed: int = 42
     log_every: int = 100
-    device: str = "cuda:1"
+    device: str = "cpu"
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
@@ -117,7 +115,7 @@ class ReplayBuffer:
         state_dim: int,
         action_dim: int,
         buffer_size: int,
-        device: str = "cuda",
+        device: str = "cpu",
     ):
         self._buffer_size = buffer_size
         self._pointer = 0
@@ -299,7 +297,7 @@ class VectorizedCritic(nn.Module):
         return q_values
 
 
-class MSG:
+class SACN:
     def __init__(
         self,
         actor: Actor,
@@ -308,9 +306,8 @@ class MSG:
         critic_optimizer: torch.optim.Optimizer,
         gamma: float = 0.99,
         tau: float = 0.005,
-        alpha: float = 0.1,
-        beta: float = -4.0,
-        device: str = "cuda:1",  # noqa
+        alpha_learning_rate: float = 1e-4,
+        device: str = "cpu",
     ):
         self.device = device
 
@@ -324,22 +321,36 @@ class MSG:
 
         self.tau = tau
         self.gamma = gamma
-        self.alpha = alpha
-        self.beta = beta
 
-    def _actor_loss(self, state: torch.Tensor) -> Tuple[torch.Tensor]:
-        action, action_log_prob = self.actor(state, need_log_prob=True)
-        # q_value_dist = [num_critic, batch_size]
-        q_value_dist = self.critic(state, action)
-        assert q_value_dist.shape[0] == self.critic.num_critics
-        # q_value_mean = [batch_size, ]
-        q_value_mean = q_value_dist.mean(0)
-        q_value_std = q_value_dist.std(0)
-        # [batch_size, ] - [batch_size, ]
-        # print("Type:", type(q_value_mean),type(q_value_std))
-        loss = -(q_value_mean + self.beta * q_value_std).mean()
+        # adaptive alpha setup
+        self.target_entropy = -float(self.actor.action_dim)
+        self.log_alpha = torch.tensor(
+            [0.0], dtype=torch.float32, device=self.device, requires_grad=True
+        )
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_learning_rate)
+        self.alpha = self.log_alpha.exp().detach()
+
+    def _alpha_loss(self, state: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            action, action_log_prob = self.actor(state, need_log_prob=True)
+
+        loss = (-self.log_alpha * (action_log_prob + self.target_entropy)).mean()
 
         return loss
+
+    def _actor_loss(self, state: torch.Tensor) -> Tuple[torch.Tensor, float, float]:
+        action, action_log_prob = self.actor(state, need_log_prob=True)
+        q_value_dist = self.critic(state, action)
+        assert q_value_dist.shape[0] == self.critic.num_critics
+        q_value_min = q_value_dist.min(0).values
+        # needed for logging
+        q_value_std = q_value_dist.std(0).mean().item()
+        batch_entropy = -action_log_prob.mean().item()
+
+        assert action_log_prob.shape == q_value_min.shape
+        loss = (self.alpha * action_log_prob - q_value_min).mean()
+
+        return loss, batch_entropy, q_value_std
 
     def _critic_loss(
         self,
@@ -353,46 +364,42 @@ class MSG:
             next_action, next_action_log_prob = self.actor(
                 next_state, need_log_prob=True
             )
-            # [num_critic, batch_size]
-            q_next = self.target_critic(next_state, next_action)
+            q_next = self.target_critic(next_state, next_action).min(0).values
+            q_next = q_next - self.alpha * next_action_log_prob
 
-            # q_target = [num_critic, batch_size, 1]
-            # [batch_size, 1] + [batch_size, 1] * [num_critic, batch_size, 1]
+            assert q_next.unsqueeze(-1).shape == done.shape == reward.shape
             q_target = reward + self.gamma * (1 - done) * q_next.unsqueeze(-1)
 
-        first_action, first_action_log_prob = self.actor(
-            state, need_log_prob=True
-        )
         q_values = self.critic(state, action)
-        q_values_2 = self.critic(state, first_action)
-        
-        # [num_critic, batch_size] - [num_critic, batch_size]
-        loss1 = ((q_values - q_target.squeeze(-1)) ** 2).mean(dim=1).sum(dim=0)
-
-        # [num_critic, batch_size] - [num_critic, batch_size]
-        # mean = [num_critic, ] - [num_critic, ]
-        loss2 = (q_values_2 - q_values).mean(dim=1).sum(dim=0)
-        loss = loss1 + self.alpha * loss2
+        # [ensemble_size, batch_size] - [1, batch_size]
+        loss = ((q_values - q_target.view(1, -1)) ** 2).mean(dim=1).sum(dim=0)
 
         return loss
 
-    def update_1(self, batch: TensorBatch) -> Dict[str, float]:
+    def update(self, batch: TensorBatch) -> Dict[str, float]:
         state, action, reward, next_state, done = [arr.to(self.device) for arr in batch]
         # Usually updates are done in the following order: critic -> actor -> alpha
         # But we found that EDAC paper uses reverse (which gives better results)
+
+        # Alpha update
+        alpha_loss = self._alpha_loss(state)
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self.alpha = self.log_alpha.exp().detach()
+
+        # Actor update
+        actor_loss, actor_batch_entropy, q_policy_std = self._actor_loss(state)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
 
         # Critic update
         critic_loss = self._critic_loss(state, action, reward, next_state, done)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
-
-        # Actor update
-        pi, pi_log_prob = self.actor(state, need_log_prob=True)
-        actor_loss = F.mse_loss(pi, action)
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
 
         #  Target networks soft update
         with torch.no_grad():
@@ -404,64 +411,26 @@ class MSG:
 
             q_random_std = self.critic(state, random_actions).std(0).mean().item()
 
-        update_1_info = {
-            # "alpha_loss": alpha_loss.item(),
+        update_info = {
+            "alpha_loss": alpha_loss.item(),
             "critic_loss": critic_loss.item(),
-            "actor_1_loss": actor_loss.item(),
-            # "batch_entropy": actor_batch_entropy,
-            # "alpha": self.alpha.item(),
-            # "q_policy_std": q_policy_std,
+            "actor_loss": actor_loss.item(),
+            "batch_entropy": actor_batch_entropy,
+            "alpha": self.alpha.item(),
+            "q_policy_std": q_policy_std,
             "q_random_std": q_random_std,
         }
-        return update_1_info
-
-    def update_2(self, batch: TensorBatch) -> Dict[str, float]:
-        state, action, reward, next_state, done = [arr.to(self.device) for arr in batch]
-        # Usually updates are done in the following order: critic -> actor -> alpha
-        # But we found that EDAC paper uses reverse (which gives better results)
-
-        # Critic update
-        critic_loss = self._critic_loss(state, action, reward, next_state, done)
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-
-        # Actor update
-        actor_loss = self._actor_loss(state)
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
-        #  Target networks soft update
-        with torch.no_grad():
-            soft_update(self.target_critic, self.critic, tau=self.tau)
-            # for logging, Q-ensemble std estimate with the random actions:
-            # a ~ U[-max_action, max_action]
-            max_action = self.actor.max_action
-            random_actions = -max_action + 2 * max_action * torch.rand_like(action)
-
-            q_random_std = self.critic(state, random_actions).std(0).mean().item()
-
-        update_2_info = {
-            # "alpha_loss": alpha_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "actor_2_loss": actor_loss.item(),
-            # "batch_entropy": actor_batch_entropy,
-            # "alpha": self.alpha.item(),
-            # "q_policy_std": q_policy_std,
-            "q_random_std": q_random_std,
-        }
-        return update_2_info
+        return update_info
 
     def state_dict(self) -> Dict[str, Any]:
         state = {
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "target_critic": self.target_critic.state_dict(),
-            # "log_alpha": self.log_alpha.item(),
+            "log_alpha": self.log_alpha.item(),
             "actor_optim": self.actor_optimizer.state_dict(),
             "critic_optim": self.critic_optimizer.state_dict(),
-            # "alpha_optim": self.alpha_optimizer.state_dict(),
+            "alpha_optim": self.alpha_optimizer.state_dict(),
         }
         return state
 
@@ -471,9 +440,9 @@ class MSG:
         self.target_critic.load_state_dict(state_dict["target_critic"])
         self.actor_optimizer.load_state_dict(state_dict["actor_optim"])
         self.critic_optimizer.load_state_dict(state_dict["critic_optim"])
-        # self.alpha_optimizer.load_state_dict(state_dict["alpha_optim"])
-        # self.log_alpha.data[0] = state_dict["log_alpha"]
-        # self.alpha = self.log_alpha.exp().detach()
+        self.alpha_optimizer.load_state_dict(state_dict["alpha_optim"])
+        self.log_alpha.data[0] = state_dict["log_alpha"]
+        self.alpha = self.log_alpha.exp().detach()
 
 
 @torch.no_grad()
@@ -544,6 +513,9 @@ def train(config: TrainConfig):
     buffer.load_d4rl_dataset(d4rl_dataset)
 
     # Actor & Critic setup
+    actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
+    actor.to(config.device)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
     critic = VectorizedCritic(
         state_dim, action_dim, config.hidden_dim, config.num_critics
     )
@@ -551,22 +523,17 @@ def train(config: TrainConfig):
     critic_optimizer = torch.optim.Adam(
         critic.parameters(), lr=config.critic_learning_rate
     )
-    actor = Actor(state_dim, action_dim, config.hidden_dim, config.max_action)
-    actor.to(config.device)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=config.actor_learning_rate)
 
-    trainer = MSG(
+    trainer = SACN(
         actor=actor,
         actor_optimizer=actor_optimizer,
         critic=critic,
         critic_optimizer=critic_optimizer,
         gamma=config.gamma,
         tau=config.tau,
-        alpha=config.alpha,
-        beta=config.beta,
+        alpha_learning_rate=config.alpha_learning_rate,
         device=config.device,
     )
-
     # saving config to the checkpoint
     if config.checkpoints_path is not None:
         print(f"Checkpoints path: {config.checkpoints_path}")
@@ -574,55 +541,15 @@ def train(config: TrainConfig):
         with open(os.path.join(config.checkpoints_path, "config.yaml"), "w") as f:
             pyrallis.dump(config, f)
 
-    # batch = buffer.sample(config.batch_size)
-    # trainer.update(batch)
-
     total_updates = 0.0
-    # for epoch in trange(config.num_warmed_epochs, desc="Training"):
-    #     # training
-    #     for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
-    #         batch = buffer.sample(config.batch_size)
-    #         update_1_info = trainer.update_1(batch)
-
-    #         if total_updates % config.log_every == 0:
-    #             wandb.log({"epoch": epoch, **update_1_info})
-
-    #         total_updates += 1
-
-    #     if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-    #         eval_returns = eval_actor(
-    #             env=eval_env,
-    #             actor=actor,
-    #             n_episodes=config.eval_episodes,
-    #             seed=config.eval_seed,
-    #             device=config.device,
-    #         )
-    #         eval_log = {
-    #             "eval/reward_mean": np.mean(eval_returns),
-    #             "eval/reward_std": np.std(eval_returns),
-    #             "epoch": epoch,
-    #         }
-    #         if hasattr(eval_env, "get_normalized_score"):
-    #             normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-    #             eval_log["eval/normalized_score_mean"] = np.mean(normalized_score)
-    #             eval_log["eval/normalized_score_std"] = np.std(normalized_score)
-
-    #         wandb.log(eval_log)
-
-    #         if config.checkpoints_path is not None:
-    #             torch.save(
-    #                 trainer.state_dict(),
-    #                 os.path.join(config.checkpoints_path, f"{epoch}.pt"),
-    #             )
-
     for epoch in trange(config.num_epochs, desc="Training"):
         # training
         for _ in trange(config.num_updates_on_epoch, desc="Epoch", leave=False):
             batch = buffer.sample(config.batch_size)
-            update_2_info = trainer.update_2(batch)
+            update_info = trainer.update(batch)
 
             if total_updates % config.log_every == 0:
-                wandb.log({"epoch": epoch, **update_2_info})
+                wandb.log({"epoch": epoch, **update_info})
 
             total_updates += 1
 
@@ -647,7 +574,7 @@ def train(config: TrainConfig):
 
             wandb.log(eval_log)
 
-            if config.checkpoints_path is not None and epoch == config.num_epochs - 1:
+            if config.checkpoints_path is not None:
                 torch.save(
                     trainer.state_dict(),
                     os.path.join(config.checkpoints_path, f"{epoch}.pt"),
