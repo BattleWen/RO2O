@@ -23,13 +23,15 @@ import yaml
 import argparse
 from typing import Optional
 import torch.nn.functional as F
+import h5py
+import time
 
 @dataclass
 class TrainConfig:
     # wandb params
-    project: str = "CORL"
-    group: str = "RO2O"
-    name: str = "RO2O"
+    project: str = "RO2O"
+    group: str = "RO2O-offline"
+    name: str = "RO2O-offline"
     # model params
     hidden_dim: int = 256
     num_critics: int = 10
@@ -60,6 +62,7 @@ class TrainConfig:
     eval_every: int = 5
     # general params
     checkpoints_path: Optional[str] = './checkpoints/'
+    data_path: str = '/mnt/data/optimal/shijiyuan/kang/.d4rl/datasets'
     deterministic_torch: bool = False
     train_seed: int = 32
     eval_seed: int = 24
@@ -67,7 +70,7 @@ class TrainConfig:
     device: str = "cuda:0"
 
     def __post_init__(self):
-        self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
+        self.name = f"{self.name}-{str(uuid.uuid4())[:8]}-{self.train_seed}"
         self.group = f"{self.group}-{self.env_name}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
@@ -629,6 +632,30 @@ def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.nda
     std = states.std(0) + eps
     return mean, std
 
+def get_data(data_path):
+    with h5py.File(data_path, 'r') as dataset:
+        N = dataset['rewards'].shape[0]
+        state_ = []
+        action_ =[]
+        reward_ = []
+        next_state_ = []
+        done_ = []
+
+        state_ = np.array(dataset['observations'])
+        action_ = np.array(dataset['actions'])
+        reward_ = np.array(np.squeeze(dataset['rewards']))
+        next_state_ = np.array(dataset['next_observations'])
+        done_ = np.array(dataset['terminals'])
+
+    return {
+        'observations': state_,
+        'actions': action_,
+        'next_observations': next_state_,
+        'rewards': reward_,
+        'terminals': done_,
+    }
+
+@pyrallis.wrap()
 def train(config: TrainConfig): 
     wandb_init(asdict(config))
     # data, evaluation, env setup
@@ -637,7 +664,17 @@ def train(config: TrainConfig):
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    dataset = d4rl.qlearning_dataset(env)
+    # dataset = d4rl.qlearning_dataset(env)
+    split_env = config.env_name.split('-')
+    if len(split_env) == 3:
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_v2.hdf5"
+        dataset = get_data(data_path)
+    if len(split_env) == 4 and split_env[2] == "expert":
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_{split_env[2]}_v2.hdf5"
+        dataset = get_data(data_path)
+    if len(split_env) == 4 and split_env[2] == "replay":
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_{split_env[2]}_v2.hdf5"
+        dataset = get_data(data_path)
 
     if config.normalize_reward:
         modify_reward(dataset, config.env_name)
@@ -745,56 +782,4 @@ def train(config: TrainConfig):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    # wandb params
-    parser.add_argument('--project', default="CORL", type=str)
-    parser.add_argument('--group', default="RORL-FT", type=str)
-    parser.add_argument('--name', default="RORL-FT", type=str)
-
-    # model params
-    parser.add_argument('--hidden_dim', default=256, type=int)
-    parser.add_argument('--num_critics', default=10, type=int)
-    parser.add_argument('--gamma', default=0.99, type=float)
-    parser.add_argument('--tau', default=5e-3, type=float)
-    parser.add_argument('--actor_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--critic_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--alpha_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--max_action', default=1.0, type=float)
-    
-    # training params
-    parser.add_argument('--buffer_size', default=2_000_000, type=int)
-    parser.add_argument('--env_name', default="walker2d-medium-v2", type=str)
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--num_epochs', default=2500, type=int)
-    parser.add_argument('--num_updates_on_epoch', default=1000, type=int)
-    parser.add_argument('--normalize_reward', default=False, type=bool)
-
-    parser.add_argument('--beta_policy', default=1.0, type=float)
-    parser.add_argument('--beta_ood', default=0.1, type=float)
-    
-    parser.add_argument('--q_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--policy_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--ood_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--sample_size', default=20, type=int)
-
-    parser.add_argument('--q_ood_uncertainty_reg', default=1.0, type=float)
-    parser.add_argument('--q_ood_uncertainty_reg_min', default=0.1, type=float)
-    parser.add_argument('--q_ood_uncertainty_decay', default=5e-7, type=float)
-
-    # evaluation params
-    parser.add_argument('--eval_episodes', default=10, type=int)
-    parser.add_argument('--eval_every', default=5, type=int)
-
-    # general params
-    parser.add_argument('--checkpoints_path', default='./checkpoints/', type=str)
-    parser.add_argument('--deterministic_torch', default=False, type=bool)
-    parser.add_argument('--train_seed', default=32, type=int)
-    parser.add_argument('--eval_seed', default=24, type=int)
-    parser.add_argument('--log_every', default=100, type=int)
-    parser.add_argument('--device', default="cuda:0", type=str)
-
-    args = parser.parse_args()
-    config = TrainConfig(**vars(args))
-
-    train(config)
+    train()
