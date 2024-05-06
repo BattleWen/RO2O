@@ -20,11 +20,13 @@ import yaml
 import torch.nn.functional as F
 import torch.nn.utils as utils
 import argparse
+import h5py
+import time
 
 @dataclass
 class TrainConfig:
     # wandb params
-    project: str = "CORL"
+    project: str = "RO2O"
     group: str = "RO2O-FT"
     name: str = "RO2O-FT"
     # model params
@@ -638,7 +640,7 @@ def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.nda
     std = states.std(0) + eps
     return mean, std
 
-# @pyrallis.wrap()
+@pyrallis.wrap()
 def online_ft(config:TrainConfig):
     wandb_init(asdict(config))
     # data, evaluation, env setup
@@ -778,48 +780,4 @@ def online_ft(config:TrainConfig):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    # wandb params
-    parser.add_argument('--project', default="CORL", type=str)
-    parser.add_argument('--group', default="RO2O-FT", type=str)
-    parser.add_argument('--name', default="RO2O-FT", type=str)
-
-    # model params
-    parser.add_argument('--hidden_dim', default=256, type=int)
-    parser.add_argument('--num_critics', default=10, type=int)
-    parser.add_argument('--gamma', default=0.99, type=float)
-    parser.add_argument('--tau', default=5e-3, type=float)    
-    parser.add_argument('--actor_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--critic_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--alpha_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--max_action', default=1.0, type=float)
-    
-    # training params
-    parser.add_argument('--buffer_size', default=2_000_000, type=int)
-    parser.add_argument('--env_name', default="antmaze-umaze-v2", type=str)
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--normalize_reward', default=True, type=bool)
-    parser.add_argument('--train_starts', default=2500, type=int)
-    parser.add_argument('--max_steps', default=250_000, type=int)
-    parser.add_argument('--memory_size', default=250_000, type=int)   
-    parser.add_argument('--beta_bc', default=1.0, type=float)
-    parser.add_argument('--beta_online', default=-4.0, type=float)
-
-    # evaluation params
-    parser.add_argument('--eval_episodes', default=100, type=int)
-    parser.add_argument('--eval_every', default=50, type=int)
-
-    # general params
-    parser.add_argument('--checkpoints_path', default='./checkpoints/', type=str)
-    parser.add_argument('--load_path', default='./checkpoints/', type=str)
-    parser.add_argument('--deterministic_torch', default=False, type=bool)
-    parser.add_argument('--eval_seed', default=24, type=int)
-    parser.add_argument('--online_ft_seed', default=24, type=int)
-    parser.add_argument('--log_every', default=100, type=int)
-    parser.add_argument('--device', default="cuda:0", type=str)
-
-    args = parser.parse_args()
-    config = TrainConfig(**vars(args))
-
-    online_ft(config)
+    online_ft()

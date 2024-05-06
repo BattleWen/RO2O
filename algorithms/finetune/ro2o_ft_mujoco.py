@@ -20,11 +20,13 @@ import yaml
 import torch.nn.functional as F
 import torch.nn.utils as utils
 import argparse
+import h5py
+import time
 
 @dataclass
 class TrainConfig:
     # wandb params
-    project: str = "CORL"
+    project: str = "RO2O"
     group: str = "RO2O-FT"
     name: str = "RO2O-FT"
     # model params
@@ -61,6 +63,7 @@ class TrainConfig:
     # general params
     checkpoints_path: Optional[str] = './checkpoints/'
     load_path: Optional[str] = './checkpoints/antmaze-umaze-v2-49c9abcf/2499.pt'
+    data_path: str = '/mnt/data/optimal/shijiyuan/kang/.d4rl/datasets'
     deterministic_torch: bool = False
     eval_seed: int = 65
     online_ft_seed: int = 54
@@ -68,7 +71,7 @@ class TrainConfig:
     device: str = "cuda:0"
 
     def __post_init__(self):
-        self.name = f"{self.name}-{self.env_name}-{str(uuid.uuid4())[:8]}"
+        self.name = f"{self.name}-{str(uuid.uuid4())[:8]}-{self.online_ft_seed}"
         self.group = f"{self.group}-{self.env_name}"
         if self.checkpoints_path is not None:
             self.checkpoints_path = os.path.join(self.checkpoints_path, self.name)
@@ -405,7 +408,8 @@ class RO2O:
         # bc_loss = F.mse_loss(pi, action)
         policy_loss = self.get_policy_loss(state, action)
 
-        loss = q_loss + policy_loss
+        # loss = q_loss + policy_loss
+        loss = q_loss
 
         return loss, q_loss, policy_loss, batch_entropy, q_value_std
 
@@ -440,7 +444,8 @@ class RO2O:
         noise_Q_loss = self.get_qf_loss(state, action)
         ood_loss = self.get_ood_loss(state, action)
 
-        loss = critic_loss1 + noise_Q_loss + ood_loss
+        # loss = critic_loss1 + noise_Q_loss + ood_loss
+        loss = critic_loss1
 
         return loss, critic_loss1, noise_Q_loss, ood_loss, q_values.mean(), q_target.mean()
 
@@ -664,14 +669,48 @@ def compute_mean_std(states: np.ndarray, eps: float) -> Tuple[np.ndarray, np.nda
     std = states.std(0) + eps
     return mean, std
 
-# @pyrallis.wrap()
+def get_data(data_path):
+    with h5py.File(data_path, 'r') as dataset:
+        N = dataset['rewards'].shape[0]
+        state_ = []
+        action_ =[]
+        reward_ = []
+        next_state_ = []
+        done_ = []
+
+        state_ = np.array(dataset['observations'])
+        action_ = np.array(dataset['actions'])
+        reward_ = np.array(np.squeeze(dataset['rewards']))
+        next_state_ = np.array(dataset['next_observations'])
+        done_ = np.array(dataset['terminals'])
+
+    return {
+        'observations': state_,
+        'actions': action_,
+        'next_observations': next_state_,
+        'rewards': reward_,
+        'terminals': done_,
+    }
+
+@pyrallis.wrap()
 def online_ft(config:TrainConfig):
     wandb_init(asdict(config))
     # data, evaluation, env setup
     env = gym.make(config.env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    dataset = d4rl.qlearning_dataset(env)
+    
+    # dataset = d4rl.qlearning_dataset(env)
+    split_env = config.env_name.split('-')
+    if len(split_env) == 3:
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_v2.hdf5"
+        dataset = get_data(data_path)
+    if len(split_env) == 4 and split_env[2] == "expert":
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_{split_env[2]}_v2.hdf5"
+        dataset = get_data(data_path)
+    if len(split_env) == 4 and split_env[2] == "replay":
+        data_path = f"{config.data_path}/{split_env[0]}_{split_env[1]}_{split_env[2]}_v2.hdf5"
+        dataset = get_data(data_path)
 
     if config.normalize_reward:
         modify_reward(dataset, config.env_name)
@@ -740,7 +779,7 @@ def online_ft(config:TrainConfig):
     trainer.load_state_dict(state_dict)
 
     env_steps = 0
-    ev_every = config.eval_every
+    ev_every = config.eval_every * 1000
     total_updates = 0
 
     while env_steps < config.max_steps + 1:
@@ -773,7 +812,7 @@ def online_ft(config:TrainConfig):
                 update_online_info = trainer.update_online(sample(minibatch))
 
                 if total_updates % config.log_every == 0:
-                    wandb.log({"epoch": env_steps // 1000, **update_online_info}, step = total_updates)
+                    wandb.log({"epoch": env_steps, **update_online_info}, step = total_updates)
 
                 total_updates += 1
 
@@ -789,7 +828,7 @@ def online_ft(config:TrainConfig):
                 eval_log = {
                     "eval/reward_mean": np.mean(eval_returns),
                     "eval/reward_std": np.std(eval_returns),
-                    "epoch": env_steps // 1000,
+                    "epoch": env_steps,
                     "steps": total_updates
                 }
                 if hasattr(eval_env, "get_normalized_score"):
@@ -810,55 +849,4 @@ def online_ft(config:TrainConfig):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    # wandb params
-    parser.add_argument('--project', default="CORL", type=str)
-    parser.add_argument('--group', default="RO2O", type=str)
-    parser.add_argument('--name', default="RO2O", type=str)
-
-    # model params
-    parser.add_argument('--hidden_dim', default=256, type=int)
-    parser.add_argument('--num_critics', default=10, type=int)
-    parser.add_argument('--gamma', default=0.99, type=float)
-    parser.add_argument('--tau', default=5e-3, type=float)
-    parser.add_argument('--actor_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--critic_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--alpha_learning_rate', default=3e-4, type=float)
-    parser.add_argument('--max_action', default=1.0, type=float)
-    
-    # training params
-    parser.add_argument('--buffer_size', default=2_000_000, type=int)
-    parser.add_argument('--env_name', default="walker2d-medium-v2", type=str)
-    parser.add_argument('--batch_size', default=256, type=int)
-    parser.add_argument('--normalize_reward', default=False, type=bool)
-    parser.add_argument('--train_starts', default=2500, type=int)
-    parser.add_argument('--max_steps', default=250_000, type=int)
-    parser.add_argument('--memory_size', default=250_000, type=int)   
-    parser.add_argument('--beta_policy', default=1.0, type=float)
-    parser.add_argument('--beta_ood', default=0.1, type=float)
-    parser.add_argument('--q_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--policy_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--ood_smooth_eps', default=0.01, type=float)
-    parser.add_argument('--sample_size', default=20, type=int)
-    parser.add_argument('--q_ood_uncertainty_reg', default=0.1, type=float)
-    parser.add_argument('--q_ood_uncertainty_reg_min', default=0.1, type=float)
-    parser.add_argument('--q_ood_uncertainty_decay', default=0, type=float)
-
-    # evaluation params
-    parser.add_argument('--eval_episodes', default=10, type=int)
-    parser.add_argument('--eval_every', default=5000, type=int)
-
-    # general params
-    parser.add_argument('--checkpoints_path', default='./checkpoints/', type=str)
-    parser.add_argument('--load_path', default='./checkpoints/', type=str)
-    parser.add_argument('--deterministic_torch', default=False, type=bool)
-    parser.add_argument('--eval_seed', default=24, type=int)
-    parser.add_argument('--online_ft_seed', default=42, type=int)
-    parser.add_argument('--log_every', default=100, type=int)
-    parser.add_argument('--device', default="cuda:0", type=str)
-
-    args = parser.parse_args()
-    config = TrainConfig(**vars(args))
-
-    online_ft(config)
+    online_ft()
